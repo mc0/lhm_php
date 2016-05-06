@@ -8,7 +8,6 @@ use PDO;
 
 class Chunker extends Command
 {
-
     /**
      * @var AdapterInterface
      */
@@ -30,13 +29,10 @@ class Chunker extends Command
     protected $sqlHelper;
 
     /** @var integer */
-    protected $nextToInsert;
+    protected $currentOffset;
 
     /** @var integer */
     protected $limit;
-
-    /** @var integer */
-    protected $start;
 
     /** @var string */
     protected $primaryKey;
@@ -67,14 +63,15 @@ class Chunker extends Command
 
         $this->options = $options + [
                 'stride' => 2000,
-                'strideMax' => 20000000,
+                'strideMax' => 20000,
                 'targetQuerySeconds' => 0.75
             ];
 
         $this->primaryKey = $this->adapter->quoteColumnName($this->sqlHelper->extractPrimaryKey($this->origin));
 
-        $this->nextToInsert = $this->start = $this->selectStart();
-        $this->limit = $this->selectLimit();
+        $this->currentOffset = 0;
+        $originName = $this->origin->getName();
+        $this->limit = $this->getMaxPrimary($originName);
 
         $this->intersection = new Intersection($this->origin, $this->destination);
     }
@@ -101,12 +98,8 @@ class Chunker extends Command
         $initialStart = microtime(true);
         $lastUpdate = 0;
         $totalRows = 0;
-        while ($this->nextToInsert < $this->limit || ($this->nextToInsert == 1 && $this->start == 1)) {
-            $top = $this->top($stride);
-            $bottom = $this->bottom();
-            $queries = $this->copy($bottom, $top);
-
-            $query = "$queries[0] $queries[1]";
+        while ($this->currentOffset < $this->limit || $this->currentOffset === 0) {
+            $query = $this->copy($this->currentOffset, $stride);
             $this->getLogger()->debug($query);
 
             $startTime = microtime(true);
@@ -115,34 +108,35 @@ class Chunker extends Command
             $totalRows += $rowCount;
             $endTime = microtime(true);
             $timing = $endTime - $startTime;
-            $this->nextToInsert = $top + 1;
 
             if ($endTime - $lastUpdate > 10) {
                 $msg = "Copied $totalRows of an estimated $estRows rows.\n";
                 $this->getLogger()->info($msg);
-                $msg = "There is a stride of $stride and a goal of $targetQuerySeconds.";
+                $msg = "There is a stride of $stride and a goal of {$targetQuerySeconds} sec/query.";
                 $this->getLogger()->info($msg);
                 $lastUpdate = $endTime;
             }
 
             if ($rowCount === 0) {
-                // find the next row
-                $result = $this->adapter->query($queries[2]);
-                $row = $result->fetch(PDO::FETCH_NUM);
-                if (!empty($row) && !empty($row[0])) {
-                    $this->nextToInsert = $row[0];
-                }
-            } else {
-                $rowsPerSec = $rowCount / $timing;
-                $trendWeight = (0.5 * ($rowsPerSec - $weightedAvgPace));
-                $weightedAvgPace = $weightedAvgPace + $trendWeight;
-                if (!empty($weightedAvgPace)) {
-                    $targetStride = $targetQuerySeconds * $weightedAvgPace;
-                    $ratio =  max(min($targetStride / $stride, 1.25), 0.5);
-                    $stride = $ratio * $stride;
-                    $stride = max(min($stride, $strideMax), $strideStart);
-                    $stride = (int)floor($stride);
-                }
+                break;
+            }
+            $newOffset = $this->getNextChunkStart($this->currentOffset, $stride);
+            if ($newOffset == $this->currentOffset) {
+                $msg = "Offset $newOffset invalid: $this->currentOffset offset / $stride stride";
+                $this->getLogger()->error($msg);
+                throw new \Exception('infinite loop due to bad primary key?');
+            }
+            $this->currentOffset = $newOffset;
+
+            $rowsPerSec = $rowCount / $timing;
+            $trendWeight = (0.5 * ($rowsPerSec - $weightedAvgPace));
+            $weightedAvgPace = $weightedAvgPace + $trendWeight;
+            if (!empty($weightedAvgPace)) {
+                $targetStride = $targetQuerySeconds * $weightedAvgPace;
+                $ratio = max(min($targetStride / $stride, 3), 0.5);
+                $stride = $ratio * $stride;
+                $stride = max(min($stride, $strideMax), $strideStart);
+                $stride = (int)ceil($stride);
             }
         }
 
@@ -164,38 +158,35 @@ class Chunker extends Command
         return $row['rows'];
     }
 
-    protected function top($stride)
+    protected function getMaxPrimary($table)
     {
-        return min(($this->nextToInsert + $stride - 1), $this->limit);
+        $name = $this->adapter->quoteTableName($table);
+        $sql = "SELECT MAX({$this->primaryKey})
+                FROM {$name}";
+        $max = $this->adapter->fetchRow($sql)[0];
+
+        return (int)$max;
     }
 
-    protected function bottom()
+    protected function getNextChunkStart($oldStart, $oldStride)
     {
-        return $this->nextToInsert;
-    }
+        $originName = $this->adapter->quoteTableName($this->origin->getName());
+        $sql = "SELECT {$this->primaryKey}
+                FROM {$originName}
+                WHERE {$this->primaryKey} >= $oldStart
+                ORDER BY {$this->primaryKey} ASC
+                LIMIT 1 OFFSET $oldStride";
+        $next = $this->adapter->fetchRow($sql)[0];
 
-    protected function selectStart()
-    {
-        $name = $this->adapter->quoteTableName($this->origin->getName());
-        $start = $this->adapter->fetchRow("SELECT MIN(id) FROM {$name}")[0];
-
-        return (int)$start;
-    }
-
-    protected function selectLimit()
-    {
-        $name = $this->adapter->quoteTableName($this->origin->getName());
-        $limit = $this->adapter->fetchRow("SELECT MAX(id) FROM {$name}")[0];
-
-        return (int)$limit;
+        return (int)$next;
     }
 
     /**
-     * @param integer $lowest
-     * @param integer $highest
+     * @param integer $current
+     * @param integer $stride
      * @return string
      */
-    protected function copy($lowest, $highest)
+    protected function copy($current, $stride)
     {
         $originName = $this->adapter->quoteTableName($this->origin->getName());
         $destinationName = $this->adapter->quoteTableName($this->destination->getName());
@@ -213,15 +204,12 @@ class Chunker extends Command
             )
         );
 
-        $queries = array(
+        return implode(" ", [
             "INSERT IGNORE INTO {$destinationName} ({$destinationColumns})",
             "SELECT {$originColumns} FROM {$originName}
-             WHERE {$originName}.{$this->primaryKey} BETWEEN {$lowest} AND {$highest}",
-            "SELECT {$originName}.{$this->primaryKey} FROM {$originName}
-             WHERE {$originName}.{$this->primaryKey} >= {$lowest}
-             LIMIT 1",
-        );
-
-        return $queries;
+             WHERE {$originName}.{$this->primaryKey} > {$current}
+             ORDER BY {$originName}.{$this->primaryKey} ASC
+             LIMIT $stride"
+        ]);
     }
 }
