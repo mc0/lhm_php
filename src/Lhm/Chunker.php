@@ -46,6 +46,21 @@ class Chunker extends Command
     protected $intersection;
 
     /**
+     * @var array
+     */
+    protected $ignoreWarningCodes = [
+        # Error: 1062 (ER_DUP_ENTRY)
+        # Message: Duplicate entry '%ld' for key '%s'
+        1062 => 1,
+        # Error: 1265 (WARN_DATA_TRUNCATED)
+        # Message: Data truncated for column '%s' at row %ld
+        1265 => 1,
+        # Error: 1592 (ER_BINLOG_UNSAFE_STATEMENT)
+        # Message: Statement may not be safe to log in statement format.
+        1592 => 1,
+    ];
+
+    /**
      * @param AdapterInterface $adapter
      * @param \Phinx\Db\Table $origin
      * @param \Lhm\Table $destination
@@ -105,6 +120,7 @@ class Chunker extends Command
             $startTime = microtime(true);
             $result = $this->adapter->query($query);
             $rowCount = $result->rowCount();
+            $warnings = $this->getWarnings();
             $totalRows += $rowCount;
             $endTime = microtime(true);
             $timing = $endTime - $startTime;
@@ -117,10 +133,20 @@ class Chunker extends Command
                 $lastUpdate = $endTime;
             }
 
-            if ($rowCount === 0) {
+            foreach ($warnings as $warning) {
+                $code = $warning['Code'];
+                if (!isset($this->ignoreWarningCodes[$code])) {
+                    throw new \Exception("Database error returned: $code");
+                }
+            }
+
+            if (empty($warnings) && $rowCount === 0) {
                 break;
             }
             $newOffset = $this->getNextChunkStart($this->currentOffset, $stride);
+            if (is_null($newOffset)) {
+                break;
+            }
             if ($newOffset == $this->currentOffset) {
                 $msg = "Offset $newOffset invalid: $this->currentOffset offset / $stride stride";
                 $this->getLogger()->error($msg);
@@ -176,9 +202,28 @@ class Chunker extends Command
                 WHERE {$this->primaryKey} >= $oldStart
                 ORDER BY {$this->primaryKey} ASC
                 LIMIT 1 OFFSET $oldStride";
-        $next = $this->adapter->fetchRow($sql)[0];
+        $row = $this->adapter->fetchRow($sql);
+        if ($row === false) {
+            throw new \Exception('failed to get next chunk; retry');
+        }
+        if (empty($row)) {
+            return null;
+        }
+        $next = $row[0];
 
         return (int)$next;
+    }
+
+    protected function getWarnings()
+    {
+        /** @var \mysqli $conn */
+        $conn = $this->adapter->getConnection();
+        if (!$conn->warning_count) {
+            return [];
+        }
+
+        $warnings = $this->adapter->fetchAll('SHOW WARNINGS');
+        return $warnings;
     }
 
     /**
@@ -205,7 +250,7 @@ class Chunker extends Command
         );
 
         return implode(" ", [
-            "INSERT IGNORE INTO {$destinationName} ({$destinationColumns})",
+            "INSERT LOW_PRIORITY IGNORE INTO {$destinationName} ({$destinationColumns})",
             "SELECT {$originColumns} FROM {$originName}
              WHERE {$originName}.{$this->primaryKey} > {$current}
              ORDER BY {$originName}.{$this->primaryKey} ASC
