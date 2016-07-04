@@ -61,6 +61,15 @@ class Chunker extends Command
     ];
 
     /**
+     * @var array
+     */
+    protected $retryErrors = [
+        'Deadlock found',
+        'Lock wait timeout exceeded',
+        'Query execution was interrupted',
+    ];
+
+    /**
      * @param AdapterInterface $adapter
      * @param \Phinx\Db\Table $origin
      * @param \Lhm\Table $destination
@@ -118,7 +127,15 @@ class Chunker extends Command
             $this->getLogger()->debug($query);
 
             $startTime = microtime(true);
-            $result = $this->adapter->query($query);
+            try {
+                $result = $this->adapter->query($query);
+            } catch (\PDOException $e) {
+                if (!$this->shouldRetry($e->getMessage())) {
+                    throw $e;
+                }
+                usleep(100);
+                $result = $this->adapter->query($query);
+            }
             $rowCount = $result->rowCount();
             $warnings = $this->getWarnings();
             $totalRows += $rowCount;
@@ -136,7 +153,7 @@ class Chunker extends Command
             foreach ($warnings as $warning) {
                 $code = $warning['Code'];
                 if (!isset($this->ignoreWarningCodes[$code])) {
-                    throw new \Exception("Database error returned: $code");
+                    throw new \Exception("Database error returned: {$warning['Message']} $code");
                 }
             }
 
@@ -203,9 +220,6 @@ class Chunker extends Command
                 ORDER BY {$this->primaryKey} ASC
                 LIMIT 1 OFFSET $oldStride";
         $row = $this->adapter->fetchRow($sql);
-        if ($row === false) {
-            throw new \Exception('failed to get next chunk; retry');
-        }
         if (empty($row)) {
             return null;
         }
@@ -216,14 +230,19 @@ class Chunker extends Command
 
     protected function getWarnings()
     {
-        /** @var \mysqli $conn */
-        $conn = $this->adapter->getConnection();
-        if (!$conn->warning_count) {
-            return [];
-        }
-
         $warnings = $this->adapter->fetchAll('SHOW WARNINGS');
         return $warnings;
+    }
+
+    protected function shouldRetry($msg)
+    {
+        foreach ($this->retryErrors as $error) {
+            if (strpos($msg, $error) !== false) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
