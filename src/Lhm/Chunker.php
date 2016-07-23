@@ -122,21 +122,29 @@ class Chunker extends Command
         $initialStart = microtime(true);
         $lastUpdate = 0;
         $totalRows = 0;
-        while ($this->currentOffset < $this->limit || $this->currentOffset === 0) {
+        while ($this->currentOffset <= $this->limit || $this->currentOffset === 0) {
             $query = $this->copy($this->currentOffset, $stride);
             $this->getLogger()->debug($query);
 
             $startTime = microtime(true);
-            try {
-                $result = $this->adapter->query($query);
-            } catch (\PDOException $e) {
-                if (!$this->shouldRetry($e->getMessage())) {
-                    throw $e;
+            $i = 0;
+            $rowCount = 0;
+            while (true) {
+                try {
+                    $result = $this->adapter->query($query);
+                    $rowCount = $result->rowCount();
+                    break;
+                } catch (\PDOException $e) {
+                    if (!$this->shouldRetry($e->getMessage())) {
+                        throw $e;
+                    }
+                    if ($i > 10) {
+                        throw $e;
+                    }
+                    usleep(max(min($i * 500, 1000), 75));
                 }
-                usleep(100);
-                $result = $this->adapter->query($query);
+                $i++;
             }
-            $rowCount = $result->rowCount();
             $warnings = $this->getWarnings();
             $totalRows += $rowCount;
             $endTime = microtime(true);
@@ -271,7 +279,7 @@ class Chunker extends Command
         return implode(" ", [
             "INSERT LOW_PRIORITY IGNORE INTO {$destinationName} ({$destinationColumns})",
             "SELECT {$originColumns} FROM {$originName}
-             WHERE {$originName}.{$this->primaryKey} > {$current}
+             WHERE {$originName}.{$this->primaryKey} >= {$current}
              ORDER BY {$originName}.{$this->primaryKey} ASC
              LIMIT $stride"
         ]);
