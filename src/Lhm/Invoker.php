@@ -10,6 +10,7 @@ class Invoker
 {
 
     const LOCK_WAIT_TIMEOUT_DELTA = -2;
+    const LOCK_WAIT_TIMEOUT_MAX = 100;
 
     /**
      * @var Table
@@ -135,12 +136,15 @@ class Invoker
         $logger->debug("Getting mysql session lock wait timeouts");
 
         //TODO File a bug with Phinx. $adapter->query does not return an array ( returns a PDOStatement )
-        $globalInnodbLockWaitTimeout = $this->adapter->query("SHOW GLOBAL VARIABLES LIKE 'innodb_lock_wait_timeout'")->fetchColumn(0);
-        $globalLockWaitTimeout = $this->adapter->query("SHOW GLOBAL VARIABLES LIKE 'lock_wait_timeout'")->fetchColumn(0);
+        $result = $this->adapter->query("SHOW GLOBAL VARIABLES LIKE 'innodb_lock_wait_timeout'")->fetch();
+        $globalInnodbLockWaitTimeout = isset($result['Value']) ? $result['Value'] : $result[0];
 
+        $result = $this->adapter->query("SHOW GLOBAL VARIABLES LIKE 'lock_wait_timeout'")->fetch();
+        $globalLockWaitTimeout = isset($result['Value']) ? $result['Value'] : $result[0];
 
         if ($globalInnodbLockWaitTimeout) {
             $value = ((int)$globalInnodbLockWaitTimeout) + static::LOCK_WAIT_TIMEOUT_DELTA;
+            $value = min($value, self::LOCK_WAIT_TIMEOUT_MAX);
 
             $logger->debug("Setting session innodb_lock_wait_timeout to `{$value}`");
 
@@ -149,6 +153,7 @@ class Invoker
 
         if ($globalLockWaitTimeout) {
             $value = ((int)$globalLockWaitTimeout) + static::LOCK_WAIT_TIMEOUT_DELTA;
+            $value = min($value, self::LOCK_WAIT_TIMEOUT_MAX);
 
             $logger->debug("Setting session lock_wait_timeout to `{$value}`");
 
