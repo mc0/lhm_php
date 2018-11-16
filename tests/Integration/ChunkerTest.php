@@ -69,7 +69,7 @@ class ChunkerTest extends \PHPUnit_Framework_TestCase
         $originColumns = [
             new Column(),
             new Column(),
-            new Column()
+            new Column(),
         ];
         $originColumns[0]->setName('id');
         $originColumns[1]->setName('name');
@@ -79,7 +79,7 @@ class ChunkerTest extends \PHPUnit_Framework_TestCase
         $destinationColumns = [
             new Column(),
             new Column(),
-            new Column()
+            new Column(),
         ];
         $destinationColumns[0]->setName('id');
         $destinationColumns[1]->setName('name');
@@ -118,7 +118,8 @@ class ChunkerTest extends \PHPUnit_Framework_TestCase
                 switch ($matcher->getInvocationCount()) {
                     case 1:
                         $this->assertEquals(
-                            "SELECT MIN(id) FROM 'users'",
+                            "SELECT MAX(`id`)
+                FROM 'users'",
                             $query
                         );
                         return [1];
@@ -130,10 +131,18 @@ class ChunkerTest extends \PHPUnit_Framework_TestCase
                         );
                         return [500];
                     default:
-
                         return null;
-                        break;
                 }
+            }));
+        $this->adapter
+            ->expects($matcher)
+            ->method('fetchAll')
+            ->will($this->returnCallback(function ($query) use ($matcher) {
+                $this->assertEquals(
+                    "SHOW WARNINGS",
+                    $query
+                );
+                return [];
             }));
 
         $matcher = $this->atLeastOnce();
@@ -151,17 +160,36 @@ class ChunkerTest extends \PHPUnit_Framework_TestCase
                         return 'id';
                     case 2:
                         $this->assertEquals(
-                            "INSERT IGNORE INTO 'users_new' (`id`,`name`) SELECT 'users'.`id`,'users'.`name` FROM 'users' WHERE 'users'.`id` BETWEEN 1 AND 200",
+                            "EXPLAIN SELECT * FROM 'users' WHERE 1",
                             $query
                         );
-                        break;
+                        $mockResult = $this->getMockBuilder(\PDOStatement::class)->getMock();
+                        $mockResult
+                            ->expects($this->any())
+                            ->method('fetch')
+                            ->will($this->returnValue(['rows' => 10]));
+                        return $mockResult;
                     case 3:
+                        $this->assertEquals(
+                            "INSERT LOW_PRIORITY IGNORE INTO 'users_new' (`id`,`name`) SELECT 'users'.`id`,'users'.`name` FROM 'users'
+             WHERE 'users'.`id` >= 0
+             ORDER BY 'users'.`id` ASC
+             LIMIT 1",
+                            $query
+                        );
+                        $mockResult = $this->getMockBuilder(\PDOStatement::class)->getMock();
+                        $mockResult
+                            ->expects($this->any())
+                            ->method('rowCount')
+                            ->will($this->returnValue(1));
+                        return $mockResult;
+                    case 4:
                         $this->assertEquals(
                             "INSERT IGNORE INTO 'users_new' (`id`,`name`) SELECT 'users'.`id`,'users'.`name` FROM 'users' WHERE 'users'.`id` BETWEEN 201 AND 400",
                             $query
                         );
                         break;
-                    case 4:
+                    case 5:
                         $this->assertEquals(
                             "INSERT IGNORE INTO 'users_new' (`id`,`name`) SELECT 'users'.`id`,'users'.`name` FROM 'users' WHERE 'users'.`id` BETWEEN 401 AND 500",
                             $query

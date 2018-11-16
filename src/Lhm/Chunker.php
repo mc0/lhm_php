@@ -2,16 +2,30 @@
 
 namespace Lhm;
 
+use Phinx\Db\Adapter\AdapterFactory;
 use Phinx\Db\Adapter\AdapterInterface;
 use PDO;
 
 
 class Chunker extends Command
 {
+    private const SLAVE_LAG_CHECK_FREQUENCY = 30; // seconds
+
+    private const MAX_ALLOWED_SLAVE_LAG = 10; // seconds
+    private const MIN_ALLOWED_SLAVE_LAG = 5; // seconds
+
+    private const MIN_DELAY_MICRO_S = 1000;
+    private const MAX_DELAY_MICRO_S = 10 * 1000 * 1000; // 10s
+
     /**
      * @var AdapterInterface
      */
     protected $adapter;
+
+    /**
+     * @var AdapterInterface[]
+     */
+    protected $slaveAdapters;
 
     /**
      * @var Table
@@ -86,18 +100,59 @@ class Chunker extends Command
         $this->sqlHelper = $sqlHelper ?: new SqlHelper($this->adapter);
 
         $this->options = $options + [
-                'stride' => 2000,
-                'strideMax' => 20000,
-                'targetQuerySeconds' => 0.75
-            ];
+            'stride' => 2000,
+            'strideMax' => 20000,
+            'targetQuerySeconds' => 0.75,
+        ];
 
         $this->primaryKey = $this->adapter->quoteColumnName($this->sqlHelper->extractPrimaryKey($this->origin));
+
+        $adapterFactory = AdapterFactory::instance();
+
+        $adapterOptions = $this->adapter->getOptions();
+
+        if (!empty($adapterOptions['auto_detect_slaves'])) {
+            $this->getLogger()->info("Attempting to auto-detect slave database connections");
+            $res = $this->adapter->query('SELECT HOST FROM INFORMATION_SCHEMA.PROCESSLIST WHERE COMMAND = \'Binlog Dump\'')->fetchAll();
+            foreach ($res as $row) {
+                list($hostname, $port) = explode(':', $row[0], 2);
+                $slaveOptions = $adapterOptions;
+                $slaveOptions['host'] = $hostname;
+                $slaveOptions['port'] = $port;
+
+                $this->slaveAdapters []= $adapterFactory->getAdapter('mysql', $slaveOptions);
+                $this->getLogger()->info("Registered slave adapter for {$slaveOptions['host']}:{$slaveOptions['port']}");
+            }
+        }
+        if (!empty($adapterOptions['slave_dbs'])) {
+            foreach ($adapterOptions['slave_dbs'] as $slaveOptions) {
+                // Override any missing values with ones from the base adapter
+                $slaveOptions = array_merge($slaveOptions, $adapterOptions);
+
+                $this->slaveAdapters []= $adapterFactory->getAdapter('mysql', $slaveOptions);
+                $this->getLogger()->info("Registered slave adapter for {$slaveOptions['host']}:{$slaveOptions['port']}");
+            }
+        }
 
         $this->currentOffset = 0;
         $originName = $this->origin->getName();
         $this->limit = $this->getMaxPrimary($originName);
 
         $this->intersection = new Intersection($this->origin, $this->destination);
+    }
+
+    private function getMaxSlaveLag()
+    {
+        $maxLag = 0;
+        foreach ($this->slaveAdapters as $slaveAdapter) {
+            $result = $slaveAdapter->query('SHOW SLAVE STATUS')->fetchAll();
+            foreach ($result as $row) {
+                $lag = $result['Seconds_Behind_Master'];
+                $maxLag = max($maxLag, $lag);
+            }
+        }
+        $this->logger->info("Max slave lag at $maxLag");
+        return $maxLag;
     }
 
     protected function execute()
@@ -122,7 +177,32 @@ class Chunker extends Command
         $initialStart = microtime(true);
         $lastUpdate = 0;
         $totalRows = 0;
+        $lastSlaveLagCheck = 0;
+        $delay = self::MIN_DELAY_MICRO_S;
+
         while ($this->currentOffset <= $this->limit || $this->currentOffset === 0) {
+            // When we have known slave databases, we need to be careful not to introduce too much slave lag
+            if (!empty($this->slaveAdapters)) {
+                // Periodically check the lag levels
+                if ($lastSlaveLagCheck < time() - self::SLAVE_LAG_CHECK_FREQUENCY) {
+                    $slaveLag = $this->getMaxSlaveLag();
+                    $lastSlaveLagCheck = time();
+
+                    if ($slaveLag > self::MAX_ALLOWED_SLAVE_LAG && $delay < self::MAX_DELAY_MICRO_S) {
+                        // slave lag is too high -- slow down
+                        $sleepyTime = max($sleepyTime * 2, self::MAX_DELAY_MICRO_S);
+                        $lastSlaveLagCheck = 0; // Also reset this so that it will be re-checked the next iteration
+                        $this->logger->warning("Slave lag over max allowed, increasing per-row delay to $delay microseconds");
+                    }
+                    if ($slaveLag < self::MIN_ALLOWED_SLAVE_LAG && $delay > self::MIN_DELAY_MICRO_S) {
+                        // slave lag is too low -- speed up
+                        $sleepyTime = min($sleepyTime / 2, self::MIN_DELAY_MICRO_S);
+                    }
+                }
+
+                usleep($delay);
+            }
+
             $query = $this->copy($this->currentOffset, $stride);
             $this->getLogger()->debug($query);
 
