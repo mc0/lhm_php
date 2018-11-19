@@ -127,7 +127,7 @@ class Chunker extends Command
         if (!empty($adapterOptions['slave_dbs'])) {
             foreach ($adapterOptions['slave_dbs'] as $slaveOptions) {
                 // Override any missing values with ones from the base adapter
-                $slaveOptions = array_merge($slaveOptions, $adapterOptions);
+                $slaveOptions = array_merge($adapterOptions, $slaveOptions);
 
                 $this->slaveAdapters []= $adapterFactory->getAdapter('mysql', $slaveOptions);
                 $this->getLogger()->info("Registered slave adapter for {$slaveOptions['host']}:{$slaveOptions['port']}");
