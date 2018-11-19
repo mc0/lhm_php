@@ -147,7 +147,7 @@ class Chunker extends Command
         foreach ($this->slaveAdapters as $slaveAdapter) {
             $result = $slaveAdapter->query('SHOW SLAVE STATUS')->fetchAll();
             foreach ($result as $row) {
-                $lag = $result['Seconds_Behind_Master'];
+                $lag = $row['Seconds_Behind_Master'];
                 $maxLag = max($maxLag, $lag);
             }
         }
