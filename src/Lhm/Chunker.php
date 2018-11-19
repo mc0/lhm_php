@@ -190,13 +190,13 @@ class Chunker extends Command
 
                     if ($slaveLag > self::MAX_ALLOWED_SLAVE_LAG && $delay < self::MAX_DELAY_MICRO_S) {
                         // slave lag is too high -- slow down
-                        $delay = max($delay * 2, self::MAX_DELAY_MICRO_S);
+                        $delay = min($delay * 2, self::MAX_DELAY_MICRO_S);
                         $lastSlaveLagCheck = 0; // Also reset this so that it will be re-checked the next iteration
                         $this->logger->warning("Slave lag over max allowed, increasing per-row delay to $delay microseconds");
                     }
                     if ($slaveLag < self::MIN_ALLOWED_SLAVE_LAG && $delay > self::MIN_DELAY_MICRO_S) {
                         // slave lag is too low -- speed up
-                        $delay = min($delay / 2, self::MIN_DELAY_MICRO_S);
+                        $delay = max($delay / 2, self::MIN_DELAY_MICRO_S);
                     }
                 }
 
