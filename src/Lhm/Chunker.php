@@ -5,6 +5,7 @@ namespace Lhm;
 use Phinx\Db\Adapter\AdapterFactory;
 use Phinx\Db\Adapter\AdapterInterface;
 use PDO;
+use PDOException;
 
 
 class Chunker extends Command
@@ -145,10 +146,16 @@ class Chunker extends Command
     {
         $maxLag = 0;
         foreach ($this->slaveAdapters as $slaveAdapter) {
-            $result = $slaveAdapter->query('SHOW SLAVE STATUS')->fetchAll();
-            foreach ($result as $row) {
-                $lag = $row['Seconds_Behind_Master'];
-                $maxLag = max($maxLag, $lag);
+            try {
+                $result = $slaveAdapter->query('SHOW SLAVE STATUS')->fetchAll();
+                foreach ($result as $row) {
+                    $lag = $row['Seconds_Behind_Master'];
+                    $maxLag = max($maxLag, $lag);
+                }
+            } catch (PDOException $e) {
+                // disconnect, we will reconnect next time we query
+                $slaveAdapter->disconnect();
+                $maxLag = self::MAX_ALLOWED_SLAVE_LAG + 1;
             }
         }
         $this->logger->info("Max slave lag at $maxLag");
@@ -192,11 +199,12 @@ class Chunker extends Command
                         // slave lag is too high -- slow down
                         $delay = min($delay * 2, self::MAX_DELAY_MICRO_S);
                         $lastSlaveLagCheck = 0; // Also reset this so that it will be re-checked the next iteration
-                        $this->logger->warning("Slave lag over max allowed, increasing per-row delay to $delay microseconds");
+                        $this->logger->warning("Slave lag over max allowed, increasing per-chunk delay to $delay microseconds");
                     }
                     if ($slaveLag < self::MIN_ALLOWED_SLAVE_LAG && $delay > self::MIN_DELAY_MICRO_S) {
                         // slave lag is too low -- speed up
                         $delay = max($delay / 2, self::MIN_DELAY_MICRO_S);
+                        $this->logger->warning("Slave lag recovering, decreasing per-chunk delay to $delay microseconds");
                     }
                 }
 
@@ -214,7 +222,7 @@ class Chunker extends Command
                     $result = $this->adapter->query($query);
                     $rowCount = $result->rowCount();
                     break;
-                } catch (\PDOException $e) {
+                } catch (PDOException $e) {
                     if (!$this->shouldRetry($e->getMessage())) {
                         throw $e;
                     }
