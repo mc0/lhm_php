@@ -4,6 +4,7 @@ namespace Lhm;
 
 use Phinx\Db\Adapter\AdapterFactory;
 use Phinx\Db\Adapter\AdapterInterface;
+use InvalidArgumentException;
 use PDO;
 use PDOException;
 
@@ -153,8 +154,12 @@ class Chunker extends Command
                     $maxLag = max($maxLag, $lag);
                 }
             } catch (PDOException $e) {
+                // expected when a backup slave is down for a backup
                 // disconnect, we will reconnect next time we query
                 $slaveAdapter->disconnect();
+                $maxLag = self::MAX_ALLOWED_SLAVE_LAG + 1;
+            } catch (InvalidArgumentException $e) {
+                // expected when a backup slave is down for a backup
                 $maxLag = self::MAX_ALLOWED_SLAVE_LAG + 1;
             }
         }
